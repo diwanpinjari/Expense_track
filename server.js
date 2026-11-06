@@ -3,10 +3,17 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { openDatabase } from './db.js';
-import { money, validDate, monthRange, passwordHash, passwordMatches, digest, csvCell, localDate } from './lib.js';
+import { money, validDate, monthRange, passwordHash, passwordMatches, digest, csvCell, localDate, otpCode, otpHash, otpMatches } from './lib.js';
+import { sendOtpEmail, emailIsConfigured } from './mailer.js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
-export function createApp({ database = join(root,'data','expenses.db') } = {}) {
+export function createApp({
+  database = join(root,'data','expenses.db'),
+  otpSender = sendOtpEmail,
+  otpSecret = process.env.OTP_SECRET || randomBytes(32).toString('hex'),
+  otpCooldownMs = 60_000,
+  otpTtlMs = 10 * 60_000
+} = {}) {
   const db = openDatabase(database);
   const app = express();
   app.disable('x-powered-by');
@@ -28,7 +35,7 @@ export function createApp({ database = join(root,'data','expenses.db') } = {}) {
     const key = req.ip; const now=Date.now();
     for (const [ip,entry] of throttle) if(now>entry.until) throttle.delete(ip);
     const entry=throttle.get(key)||{count:0,until:now+15*60*1000}; entry.count++; throttle.set(key,entry);
-    if(entry.count>40) return res.status(429).json({error:'Too many attempts. Please try again in 15 minutes.'});
+    if(entry.count>60) return res.status(429).json({error:'Too many attempts. Please try again in 15 minutes.'});
     next();
   }
   function establish(user,req,res) {
@@ -39,15 +46,110 @@ export function createApp({ database = join(root,'data','expenses.db') } = {}) {
     res.cookie('pet_session',token,{httpOnly:true,sameSite:'lax',secure:req.secure,maxAge:8*60*60*1000,path:'/'});
     res.json({user:{id:user.id,name:user.name,email:user.email},csrf});
   }
-  app.post('/api/register',authLimit,(req,res) => {
-    const {name,email,password} = req.body;
-    if(typeof name!=='string'||name.trim().length<2||name.trim().length>60) return res.status(400).json({error:'Enter a name between 2 and 60 characters.'});
-    if(typeof email!=='string'||email.length>150||!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({error:'Enter a valid email address.'});
-    if(typeof password!=='string'||password.length<8||password.length>128) return res.status(400).json({error:'Use a password between 8 and 128 characters.'});
-    const cleanEmail=email.trim().toLowerCase();
-    if(db.prepare('SELECT id FROM users WHERE email=?').get(cleanEmail)) return res.status(409).json({error:'This email is already registered. Please sign in.'});
-    const id=Number(db.prepare('INSERT INTO users(name,email,password_hash) VALUES(?,?,?)').run(name.trim(),cleanEmail,passwordHash(password)).lastInsertRowid);
-    establish({id,name:name.trim(),email:cleanEmail},req,res);
+  function registrationDetails(body) {
+    const {name,email,password} = body;
+    if(typeof name!=='string'||name.trim().length<2||name.trim().length>60) throw new Error('Enter a name between 2 and 60 characters.');
+    if(typeof email!=='string'||email.length>150||!/^\S+@\S+\.\S+$/.test(email)) throw new Error('Enter a valid email address.');
+    if(typeof password!=='string'||password.length<8||password.length>128) throw new Error('Use a password between 8 and 128 characters.');
+    return { name:name.trim(), email:email.trim().toLowerCase(), passwordHash:passwordHash(password) };
+  }
+  function secondsUntilResend(pending) {
+    if(!pending) return 0;
+    return Math.max(0, Math.ceil((pending.sent_at + otpCooldownMs - Date.now()) / 1000));
+  }
+  function otpResponse(email,delivery) {
+    return { email, delivery, expiresIn: Math.round(otpTtlMs / 1000), resendAfter: Math.round(otpCooldownMs / 1000) };
+  }
+  app.post('/api/register/request-otp',authLimit,async(req,res) => {
+    let email = '';
+    let codeHash = '';
+    try {
+      const details = registrationDetails(req.body);
+      email = details.email;
+      db.prepare('DELETE FROM registration_otps WHERE expires_at<?').run(Date.now());
+      if(db.prepare('SELECT id FROM users WHERE email=?').get(email)) return res.status(409).json({error:'This email is already registered. Please sign in.'});
+      const pending = db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
+      const wait = secondsUntilResend(pending);
+      if(wait > 0) return res.status(429).json({error:`A code was sent recently. Please wait ${wait} seconds before requesting another.`,retryAfter:wait});
+      const code = otpCode();
+      codeHash = otpHash(code,otpSecret);
+      const now = Date.now();
+      db.prepare(`INSERT INTO registration_otps(email,name,password_hash,otp_hash,expires_at,attempts,sent_at)
+        VALUES(?,?,?,?,?,0,?)
+        ON CONFLICT(email) DO UPDATE SET name=excluded.name,password_hash=excluded.password_hash,
+        otp_hash=excluded.otp_hash,expires_at=excluded.expires_at,attempts=0,sent_at=excluded.sent_at`)
+        .run(email,details.name,details.passwordHash,codeHash,now+otpTtlMs,now);
+      const { delivery } = await otpSender({ to: email, name: details.name, code });
+      res.json(otpResponse(email,delivery));
+    } catch(error) {
+      if(email) db.prepare('DELETE FROM registration_otps WHERE email=? AND otp_hash=?').run(email,codeHash);
+      if(['Enter a name between 2 and 60 characters.','Enter a valid email address.','Use a password between 8 and 128 characters.'].includes(error.message)) return res.status(400).json({error:error.message});
+      console.error('Could not send the verification code:', error.message);
+      res.status(502).json({error:'We could not send the verification code. Please try again.'});
+    }
+  });
+  app.post('/api/register/verify-otp',authLimit,(req,res) => {
+    try {
+      const email = typeof req.body.email==='string' ? req.body.email.trim().toLowerCase() : '';
+      const code = typeof req.body.otp==='string' ? req.body.otp.trim() : '';
+      if(!/^\d{6}$/.test(code)) return res.status(400).json({error:'Enter the 6-digit code from your email.'});
+      const pending = db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
+      if(!pending) return res.status(400).json({error:'This code is no longer valid. Start the account creation again.'});
+      if(pending.expires_at <= Date.now()) {
+        db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+        return res.status(410).json({error:'That code has expired. Request a new one.'});
+      }
+      if(pending.attempts >= 5) {
+        db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+        return res.status(429).json({error:'Too many incorrect attempts. Request a new code.'});
+      }
+      if(!otpMatches(code,pending.otp_hash,otpSecret)) {
+        const attempts = pending.attempts + 1;
+        if(attempts >= 5) {
+          db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+          return res.status(429).json({error:'Too many incorrect attempts. Request a new code.'});
+        }
+        db.prepare('UPDATE registration_otps SET attempts=? WHERE email=?').run(attempts,email);
+        return res.status(401).json({error:`That code is not correct. ${5-attempts} ${5-attempts===1?'attempt':'attempts'} remaining.`});
+      }
+      if(db.prepare('SELECT id FROM users WHERE email=?').get(email)) {
+        db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+        return res.status(409).json({error:'This email is already registered. Please sign in.'});
+      }
+      let id;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        id=Number(db.prepare('INSERT INTO users(name,email,password_hash) VALUES(?,?,?)').run(pending.name,email,pending.password_hash).lastInsertRowid);
+        db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+        db.exec('COMMIT');
+      } catch(error) { db.exec('ROLLBACK'); throw error; }
+      establish({id,name:pending.name,email},req,res);
+    } catch(error) {
+      console.error('Could not verify the account code:', error.message);
+      res.status(500).json({error:'We could not create your account. Please try again.'});
+    }
+  });
+  app.post('/api/register/resend-otp',authLimit,async(req,res) => {
+    const email = typeof req.body.email==='string' ? req.body.email.trim().toLowerCase() : '';
+    try {
+      const pending = db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
+      if(!pending) return res.status(404).json({error:'Start the account creation again to request a new code.'});
+      const wait = secondsUntilResend(pending);
+      if(wait > 0) return res.status(429).json({error:`Please wait ${wait} seconds before requesting another code.`,retryAfter:wait});
+      if(db.prepare('SELECT id FROM users WHERE email=?').get(email)) {
+        db.prepare('DELETE FROM registration_otps WHERE email=?').run(email);
+        return res.status(409).json({error:'This email is already registered. Please sign in.'});
+      }
+      const code = otpCode();
+      const codeHash = otpHash(code,otpSecret);
+      const now = Date.now();
+      db.prepare('UPDATE registration_otps SET otp_hash=?,expires_at=?,attempts=0,sent_at=? WHERE email=?').run(codeHash,now+otpTtlMs,now,email);
+      try { const { delivery } = await otpSender({ to: email, name: pending.name, code }); res.json(otpResponse(email,delivery)); }
+      catch(error) { db.prepare('DELETE FROM registration_otps WHERE email=? AND otp_hash=?').run(email,codeHash); throw error; }
+    } catch(error) {
+      console.error('Could not resend the verification code:', error.message);
+      res.status(502).json({error:'We could not send the code. Please try again.'});
+    }
   });
   app.post('/api/login',authLimit,(req,res) => {
     const {email,password}=req.body;
@@ -136,6 +238,6 @@ export function createApp({ database = join(root,'data','expenses.db') } = {}) {
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const {app,db}=createApp(); const port=Number(process.env.PORT)||3100;
-  const server=app.listen(port,'127.0.0.1',()=>console.log(`\nPersonal Expense Tracker\nOpen http://localhost:${port}\nCreate your account to start tracking your finances.\nData is saved in ${join(root,'data','expenses.db')}\n`));
+  const server=app.listen(port,'127.0.0.1',()=>console.log(`\nPersonal Expense Tracker\nOpen http://localhost:${port}\nCreate your account to start tracking your finances.\n${emailIsConfigured()?'OTP delivery: email configured.':'OTP delivery: not configured — codes will appear in this window.'}\nData is saved in ${join(root,'data','expenses.db')}\n`));
   server.on('error',error=>{console.error(error.code==='EADDRINUSE'?`Port ${port} is in use. Close the other app or set PORT to another number.`:error);db.close();process.exitCode=1;});
 }

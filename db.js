@@ -28,6 +28,10 @@ export function openDatabase(path) {
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       csrf TEXT NOT NULL, expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS registration_otps (
+      email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL,
+      otp_hash TEXT NOT NULL, expires_at INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, sent_at INTEGER NOT NULL);
   `);
   const categories = [
     ['Food & dining','expense','#e9aa4b','utensils'],['Transport','expense','#7996df','car'],

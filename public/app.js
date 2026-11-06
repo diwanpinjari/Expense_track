@@ -36,7 +36,20 @@ async function api(path,options={}) {
 }
 const brand=()=>`<div class="brand"><img src="/favicon.svg" alt="" width="38" height="38"><div>expense<span>PERSONAL FINANCE</span></div></div>`;
 
-function renderAuth(register=false) {
+let otpTimer = null;
+function clearOtpTimer() { if (otpTimer) { clearInterval(otpTimer); otpTimer = null; } }
+async function finishAuth(result) {
+  state.user = result.user;
+  state.csrf = result.csrf;
+  state.categories = await api('/categories');
+  state.view = 'dashboard';
+  state.month = today().slice(0, 7);
+  resetFilters();
+  shell();
+  await refresh();
+}
+function renderAuth(register=false, prefilledEmail='') {
+  clearOtpTimer();
   document.title='Welcome · Personal Expense Tracker';
   $('#app').innerHTML=`<main class="auth-layout">
     <section class="auth-story">${brand()}
@@ -56,13 +69,13 @@ function renderAuth(register=false) {
     <section class="auth-form-side"><div class="auth-form-wrap">
       <div class="eyebrow">PERSONAL EXPENSE TRACKER</div>
       <h2>${register?'A fresh start for your money.':'Welcome back.'}</h2>
-      <p class="muted">${register?'Create your private account and start with a clean slate.':'Sign in and get a clearer picture of your finances.'}</p>
+      <p class="muted">${register?'Create your private account. We’ll verify your email before it is opened.':'Sign in and get a clearer picture of your finances.'}</p>
       <form id="auth-form">
         ${register?'<label>Full name<input name="name" autocomplete="name" placeholder="Your name" minlength="2" maxlength="60" required></label>':''}
-        <label>Email address<input name="email" type="email" autocomplete="email" placeholder="Enter your email address" maxlength="150" required></label>
+        <label>Email address<input name="email" type="email" autocomplete="email" placeholder="Enter your email address" value="${esc(prefilledEmail)}" maxlength="150" required></label>
         <label>Password<div class="password-field"><input name="password" type="password" autocomplete="${register?'new-password':'current-password'}" placeholder="${register?'At least 8 characters':'Enter your password'}" ${register?'minlength="8"':''} maxlength="128" required><button type="button" id="show-password">Show</button></div></label>
         <p id="auth-error" class="form-error" role="alert"></p>
-        <button class="btn primary auth-submit">${register?'Create account':'Sign in'} ${icon('arrow')}</button>
+        <button class="btn primary auth-submit">${register?'Continue to verification':'Sign in'} ${icon('arrow')}</button>
       </form>
       <p class="auth-switch">${register?'Already have an account?':'New here?'} <button id="auth-switch" class="text-button">${register?'Sign in':'Create an account'}</button></p>
       <div class="auth-note">Made for mindful spending. Built for you.</div>
@@ -71,12 +84,89 @@ function renderAuth(register=false) {
   $('#auth-switch').onclick=()=>renderAuth(!register);
   $('#show-password').onclick=event=>{const input=$('[name=password]');input.type=input.type==='password'?'text':'password';event.target.textContent=input.type==='password'?'Show':'Hide';};
   const submit=async values=>{
-    const button=$('.auth-submit');button.disabled=true;button.textContent=register?'Creating account…':'Signing in…';$('#auth-error').textContent='';
-    try {const result=await api(register?'/register':'/login',{method:'POST',body:JSON.stringify(values)});state.user=result.user;state.csrf=result.csrf;state.categories=await api('/categories');state.view='dashboard';state.month=today().slice(0,7);resetFilters();shell();await refresh();}
-    catch(error){if($('#auth-error'))$('#auth-error').textContent=error.message;button.disabled=false;button.textContent=register?'Create account':'Sign in';}
+    const button=$('.auth-submit');button.disabled=true;button.textContent=register?'Sending code…':'Signing in…';$('#auth-error').textContent='';
+    try {
+      if (register) {
+        const sent = await api('/register/request-otp',{method:'POST',body:JSON.stringify(values)});
+        renderOtp(sent);
+      } else {
+        const result = await api('/login',{method:'POST',body:JSON.stringify(values)});
+        await finishAuth(result);
+      }
+    } catch(error) {
+      if($('#auth-error'))$('#auth-error').textContent=error.message;
+      button.disabled=false;
+      button.textContent=register?'Continue to verification':'Sign in';
+    }
   };
   $('#auth-form').onsubmit=event=>{event.preventDefault();submit(Object.fromEntries(new FormData(event.target)));};
 }
+function renderOtp({ email, delivery, resendAfter, expiresIn }) {
+  clearOtpTimer();
+  document.title='Verify your email · Personal Expense Tracker';
+  const minutes = Math.max(1, Math.ceil(expiresIn / 60));
+  $('.auth-form-wrap').innerHTML=`
+    <button type="button" id="otp-back" class="back-button">${icon('chevron')} Use a different email</button>
+    <div class="eyebrow">VERIFY YOUR EMAIL</div>
+    <h2>One last step.</h2>
+    <p class="muted">Enter the 6-digit code sent to<br><strong class="otp-email">${esc(email)}</strong></p>
+    ${delivery === 'console' ? `<div class="otp-console-note">${icon('shield')}<span>Email delivery isn’t set up on this computer yet. Your code is shown in the server window.</span></div>` : ''}
+    <form id="otp-form" novalidate>
+      <label for="otp">Verification code</label>
+      <input id="otp" name="otp" class="otp-input" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" aria-describedby="otp-help" required>
+      <p id="otp-help" class="otp-help">The code expires in ${minutes} minute${minutes===1?'':'s'}.</p>
+      <p id="otp-error" class="form-error" role="alert"></p>
+      <button class="btn primary auth-submit">Verify and create account ${icon('arrow')}</button>
+    </form>
+    <p class="otp-resend">Didn’t get it? <button type="button" id="resend-otp" class="text-button" disabled>Resend code</button></p>
+    <div class="auth-note">Check your spam folder if the email doesn’t arrive.</div>`;
+  const input=$('#otp');
+  const resend=$('#resend-otp');
+  let remaining=Number(resendAfter)||0;
+  function tick() {
+    if(!document.contains(resend)) return clearOtpTimer();
+    if(remaining>0) { resend.disabled=true; resend.textContent=`Resend in ${remaining}s`; remaining--; }
+    else { resend.disabled=false; resend.textContent='Resend code'; }
+  }
+  tick();
+  otpTimer=setInterval(tick,1000);
+  input.focus();
+  input.addEventListener('input',()=>{ input.value=input.value.replace(/\D/g,'').slice(0,6); if(input.value.length===6) $('#otp-error').textContent=''; });
+  $('#otp-back').onclick=()=>{clearOtpTimer();renderAuth(true,email);};
+  $('#otp-form').onsubmit=async event=>{
+    event.preventDefault();
+    const code=input.value.trim();
+    if(!/^\d{6}$/.test(code)) { $('#otp-error').textContent='Enter the 6-digit code from your email.'; input.focus(); return; }
+    const button=event.target.querySelector('button[type=submit],.auth-submit');
+    button.disabled=true; button.textContent='Verifying…'; $('#otp-error').textContent='';
+    try {
+      const result=await api('/register/verify-otp',{method:'POST',body:JSON.stringify({email,otp:code})});
+      clearOtpTimer();
+      await finishAuth(result);
+      toast('Your account is ready. Welcome.');
+    } catch(error) {
+      $('#otp-error').textContent=error.message;
+      button.disabled=false; button.textContent='Verify and create account';
+      input.select();
+    }
+  };
+  resend.onclick=async()=>{
+    resend.disabled=true; resend.textContent='Sending…'; $('#otp-error').textContent='';
+    try {
+      const result=await api('/register/resend-otp',{method:'POST',body:JSON.stringify({email})});
+      clearOtpTimer();
+      remaining=Number(result.resendAfter)||60;
+      tick();
+      otpTimer=setInterval(tick,1000);
+      toast(result.delivery==='console'?'A new code is in the server window.':'A new code has been sent.');
+      input.focus();
+    } catch(error) {
+      $('#otp-error').textContent=error.message;
+      resend.disabled=false; resend.textContent='Resend code';
+    }
+  };
+}
+
 function resetFilters(){state.kind='';state.category='';state.q='';state.page=1;}
 const titles={dashboard:'Overview',transactions:'Transactions',budgets:'Budgets',reports:'Reports'};
 function shell() {

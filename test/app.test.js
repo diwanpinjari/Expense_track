@@ -1,20 +1,32 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../server.js';
-import { money, validDate, monthRange, csvCell } from '../lib.js';
+import { money, validDate, monthRange, csvCell, otpCode, otpHash, otpMatches } from '../lib.js';
 
 let db, server, base, alice, bob;
+const sentCodes = new Map();
 async function request(path,{user,method='GET',data,headers={}}={}) {
   const response=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(user?{Cookie:user.cookie,'X-CSRF-Token':user.csrf}:{}),...headers},body:data===undefined?undefined:JSON.stringify(data)});
   const body=response.headers.get('content-type')?.includes('json')?await response.json():await response.text();
   return {status:response.status,body,response};
 }
+async function requestOtp(name,email) {
+  const r=await request('/api/register/request-otp',{method:'POST',data:{name,email,password:'TestPassword123!'}});
+  assert.equal(r.status,200);
+  return sentCodes.get(email.trim().toLowerCase());
+}
 async function register(name,email) {
-  const r=await request('/api/register',{method:'POST',data:{name,email,password:'TestPassword123!'}});
+  const otp=await requestOtp(name,email);
+  const r=await request('/api/register/verify-otp',{method:'POST',data:{email,otp}});
   assert.equal(r.status,200);return {cookie:r.response.headers.get('set-cookie').split(';')[0],csrf:r.body.csrf,id:r.body.user.id};
 }
 before(async()=>{
-  const app=createApp({database:':memory:'});db=app.db;
+  const app=createApp({
+    database:':memory:',
+    otpSecret:'a-test-only-secret',
+    otpCooldownMs:0,
+    otpSender:async({to,code})=>{sentCodes.set(to,code);return {delivery:'console'};}
+  });db=app.db;
   server=app.app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
   base=`http://127.0.0.1:${server.address().port}`;
   alice=await register('Alice','alice@example.com');bob=await register('Bob','bob@example.com');
@@ -32,18 +44,62 @@ test('dates and month boundaries include leap years',()=>{
 test('CSV quoting neutralises formulas and keeps commas',()=>{
   assert.equal(csvCell('=1+1'),'"\'=1+1"');assert.equal(csvCell('  @SUM(A1)'),'"\'  @SUM(A1)"');assert.equal(csvCell('coffee, "large"'),'"coffee, ""large"""');
 });
+test('OTP codes are six digits and can only be checked with the server secret',()=>{
+  const code=otpCode();assert.match(code,/^\d{6}$/);
+  const stored=otpHash(code,'secret-one');
+  assert.equal(otpMatches(code,stored,'secret-one'),true);
+  assert.equal(otpMatches(code,stored,'secret-two'),false);
+  assert.equal(otpMatches('000000',stored,'secret-one'),false);
+});
 test('private endpoints require sign in',async()=>assert.equal((await request('/api/transactions')).status,401));
 test('fresh installation and newly registered accounts have no financial data',async()=>{
   const fresh=createApp({database:':memory:'});
   try {
-    for(const name of ['users','transactions','budgets','sessions']) assert.equal(fresh.db.prepare(`SELECT COUNT(*) count FROM ${name}`).get().count,0);
+    for(const name of ['users','transactions','budgets','sessions','registration_otps']) assert.equal(fresh.db.prepare(`SELECT COUNT(*) count FROM ${name}`).get().count,0);
   } finally {fresh.db.close();}
   const summary=(await request('/api/summary?month=2026-11',{user:alice})).body;
   assert.equal(summary.income,0);assert.equal(summary.expense,0);assert.equal(summary.balance,0);assert.equal(summary.count,0);
   assert.deepEqual(summary.breakdown,[]);assert.deepEqual(summary.budgets,[]);assert.deepEqual(summary.daily,[]);
 });
+test('account is not created until the emailed code is verified',async()=>{
+  const email='pending@example.com';
+  const otp=await requestOtp('Pending Person',email);
+  assert.match(otp,/^\d{6}$/);
+  assert.equal(db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
+  const pending=db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
+  assert.ok(pending);assert.notEqual(pending.password_hash,'TestPassword123!');assert.notEqual(pending.otp_hash,otp);
+  const wrong=await request('/api/register/verify-otp',{method:'POST',data:{email,otp:String((Number(otp)+1)%1000000).padStart(6,'0')}});
+  assert.equal(wrong.status,401);assert.match(wrong.body.error,/4 attempts remaining/);
+  assert.equal(db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
+  const verified=await request('/api/register/verify-otp',{method:'POST',data:{email,otp}});
+  assert.equal(verified.status,200);assert.equal(verified.body.user.email,email);
+  assert.equal(db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
+  assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp}})).status,400);
+});
+test('resending replaces the old code and expired codes are rejected',async()=>{
+  const email='resend@example.com';
+  const first=await requestOtp('Resend Person',email);
+  const resent=await request('/api/register/resend-otp',{method:'POST',data:{email}});
+  assert.equal(resent.status,200);assert.match(resent.body.delivery,/^(email|console)$/);
+  const second=sentCodes.get(email);assert.notEqual(first,second);
+  assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp:first}})).status,401);
+  db.prepare('UPDATE registration_otps SET expires_at=? WHERE email=?').run(Date.now()-1,email);
+  assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp:second}})).status,410);
+  assert.equal((await request('/api/register/resend-otp',{method:'POST',data:{email}})).status,404);
+});
+test('five incorrect attempts invalidate the code',async()=>{
+  const email='attempts@example.com';
+  await requestOtp('Attempt Person',email);
+  for(let attempt=1;attempt<=4;attempt++) {
+    const r=await request('/api/register/verify-otp',{method:'POST',data:{email,otp:'000000'}});
+    assert.equal(r.status,401);
+  }
+  const last=await request('/api/register/verify-otp',{method:'POST',data:{email,otp:'000000'}});
+  assert.equal(last.status,429);assert.match(last.body.error,/Too many incorrect attempts/);
+  assert.equal(db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
+});
 test('duplicate registration is rejected case insensitively',async()=>{
-  const r=await request('/api/register',{method:'POST',data:{name:'Another Alice',email:'ALICE@example.com',password:'TestPassword123!'}});assert.equal(r.status,409);
+  const r=await request('/api/register/request-otp',{method:'POST',data:{name:'Another Alice',email:'ALICE@example.com',password:'TestPassword123!'}});assert.equal(r.status,409);
 });
 test('sign in verifies password and sets HTTP-only cookie',async()=>{
   assert.equal((await request('/api/login',{method:'POST',data:{email:'alice@example.com',password:'wrong'}})).status,401);
@@ -52,7 +108,7 @@ test('sign in verifies password and sets HTTP-only cookie',async()=>{
 });
 test('write operations reject missing CSRF and foreign origins',async()=>{
   assert.equal((await request('/api/transactions',{user:alice,method:'POST',headers:{'X-CSRF-Token':''},data:{}})).status,403);
-  assert.equal((await request('/api/register',{method:'POST',headers:{Origin:'https://another-site.example'},data:{}})).status,403);
+  assert.equal((await request('/api/register/request-otp',{method:'POST',headers:{Origin:'https://another-site.example'},data:{}})).status,403);
 });
 test('transaction type, amount and date validation',async()=>{
   const values={kind:'expense',category:1,amount:'25.00',date:'2026-10-15',note:'Lunch'};

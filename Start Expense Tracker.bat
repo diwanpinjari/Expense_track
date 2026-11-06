@@ -8,5 +8,5 @@ if errorlevel 1 (
 )
 if not exist node_modules call npm.cmd install
 start "" http://localhost:3100
-node server.js
+node --env-file-if-exists=.env server.js
 pause

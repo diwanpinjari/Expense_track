@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import { randomBytes, randomInt, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 
 export function passwordHash(password) {
   const salt = randomBytes(16).toString('hex');
@@ -9,6 +9,12 @@ export function passwordMatches(password, stored) {
   return timingSafeEqual(scryptSync(password, salt, 64), Buffer.from(hash, 'hex'));
 }
 export const digest = value => createHash('sha256').update(value).digest('hex');
+export const otpCode = () => String(randomInt(0, 1_000_000)).padStart(6, '0');
+export const otpHash = (code, secret) => createHmac('sha256', secret).update(String(code)).digest('hex');
+export function otpMatches(code, stored, secret) {
+  if (typeof stored !== 'string' || stored.length !== 64) return false;
+  return timingSafeEqual(Buffer.from(otpHash(code, secret), 'hex'), Buffer.from(stored, 'hex'));
+}
 export function money(value) {
   const text = String(value ?? '').trim();
   if (!/^\d{1,9}(\.\d{1,2})?$/.test(text)) throw new Error('Enter a positive amount with up to two decimal places.');
