@@ -8,7 +8,7 @@ Built with **Node.js, Express and SQLite**, with plain HTML, CSS and JavaScript 
 
 ## What you can do
 
-- Create a private account and keep your records separate from other users.
+- Create a private account and confirm it with a six-digit verification code.
 - Add income and expenses, then edit or delete entries when needed.
 - Search your history and filter it by month, category or transaction type.
 - Check monthly income, spending, net balance and savings rate.
@@ -18,6 +18,26 @@ Built with **Node.js, Express and SQLite**, with plain HTML, CSS and JavaScript 
 - Use the same website on a phone, tablet or desktop.
 
 Accounts start empty. There are no preset users, transactions or budgets, and the sign-in page does not show financial figures. All totals come from the entries you save. The built-in categories are just labels to help organise those entries.
+
+## Email verification
+
+Creating an account takes two steps. After entering your name, email and password, the app sends a six-digit code. The account is not created until that code is entered correctly. Codes expire after 10 minutes, allow five attempts and can be resent after 60 seconds.
+
+### Connect a real email sender
+
+The app uses SMTP, so it works with Gmail, Outlook, Brevo or another email provider. Copy `.env.example` to `.env` and fill in the SMTP settings:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+For Gmail, turn on two-step verification and create an **App Password**; use that 16-character password as `SMTP_PASS`. Never put a normal Google password in the file. `.env` is ignored by Git.
+
+The Windows launcher and both npm scripts load `.env` automatically. Restart the server after changing it. Also set `OTP_SECRET` to a long random value so pending codes survive a restart.
+
+### Without email settings
+
+If SMTP is not configured, the app still works for local testing: the code is printed in the **server window**. The website says this on the verification screen. That fallback is convenient on a personal computer, but it is not suitable for a public deployment because anyone who can see the terminal can read the code.
 
 ## Run it locally
 
@@ -40,11 +60,11 @@ For development, `npm run dev` restarts the server when its source files change.
 
 ## How it works
 
-Express serves the website and handles the API. SQLite stores accounts, transactions and budgets in `data/expenses.db`. Once the dependencies are installed, the app runs locally without an internet connection or an external database service.
+Express serves the website and handles the API. SQLite stores accounts, transactions and budgets in `data/expenses.db`. Once the dependencies are installed, the app runs locally without an external database service.
 
 Amounts are stored as integer paise to keep calculations exact. Reports and budget figures are calculated from the ledger, so changing or deleting an entry also changes the totals.
 
-Passwords are stored as salted scrypt hashes. Sessions use HTTP-only cookies, write requests require CSRF tokens, and database queries are restricted to the signed-in user. CSV exports escape fields and neutralise spreadsheet formulas.
+Passwords are stored as salted scrypt hashes. Verification codes are stored as keyed hashes, not plain text. Sessions use HTTP-only cookies, write requests require CSRF tokens, and database queries are restricted to the signed-in user. CSV exports escape fields and neutralise spreadsheet formulas.
 
 ## A few details about the totals
 
@@ -61,7 +81,7 @@ Transactions are entered manually. Bank connections, payment processing and auto
 npm test
 ```
 
-The 14 tests cover money and date validation, empty accounts, sign-in, account isolation, transaction changes, monthly totals, budgets, CSV export and database constraints. They use a separate in-memory database and do not touch your saved records.
+The 18 tests cover money and date validation, empty accounts, OTP creation and expiry, incorrect-attempt limits, sign-in, account isolation, transaction changes, monthly totals, budgets, CSV export and database constraints. They use a separate in-memory database and do not touch your saved records.
 
 Browser checks are documented in [VERIFICATION.md](VERIFICATION.md).
 
@@ -70,7 +90,9 @@ Browser checks are documented in [VERIFICATION.md](VERIFICATION.md).
 ```text
 server.js                 Express server, authentication and API
 db.js                     SQLite schema and category definitions
-lib.js                    Money, date, password and CSV helpers
+lib.js                    Money, date, password and OTP helpers
+mailer.js                 Optional SMTP delivery for verification codes
+.env.example              Email and OTP configuration template
 public/
   index.html              Website entry point
   app.js                  Screens and browser interactions

@@ -4,13 +4,14 @@ Verified locally on 6 November 2026 with Node.js 24.19.0 and Microsoft Edge.
 
 ## Automated API and domain tests
 
-`npm.cmd test`: **14 passed, 0 failed**.
+`npm.cmd test`: **18 passed, 0 failed**.
 
-Coverage includes exact money conversion, invalid dates, CSV escaping, required authentication, an empty fresh installation and new account, duplicate registration, password checks, HTTP-only cookies, CSRF/origin checks, transaction validation, per-account isolation, ledger changes, monthly boundaries, budget upserts, overspending, filtered exports, database constraints and session invalidation.
+Coverage includes exact money conversion, invalid dates, CSV escaping, OTP generation and hashing, account creation only after verification, OTP expiry, resend behaviour, incorrect-attempt limits, required authentication, an empty fresh installation and new account, duplicate registration, password checks, HTTP-only cookies, CSRF/origin checks, transaction validation, per-account isolation, ledger changes, monthly boundaries, budget upserts, overspending, filtered exports, database constraints and session invalidation.
 
 ## Browser verification
 
-- Account registration, sign-in and sign-out.
+- Account registration through the two-step OTP screen, sign-in and sign-out.
+- Verification code accepted only after it is entered; the account remains absent until then.
 - Registering an empty private account.
 - Adding, editing and deleting a transaction through the interface.
 - Reloading the page and confirming the saved transaction remains.
@@ -31,8 +32,11 @@ The latest browser check also confirms:
 - Charts show an empty state until the user records financial activity.
 - Saving an income entry updates the balance to that exact amount and persists after reload.
 - Signing out returns to a page with no personal financial figures.
+- The OTP screen shows the destination email, a 60-second resend timer and a note when local console delivery is being used.
 
-All previously generated financial records and their preset account were removed. Temporary verification entries and accounts were cleaned up. The current database has **0 accounts, 0 transactions and 0 budgets**, ready for users to register and enter their own records.
+Temporary verification accounts and pending codes were removed after the checks. The automated suite uses its own in-memory database, so it does not change the local database.
+
+Email delivery is currently not configured on this computer; verification codes appear in the server window. Add the SMTP values from `.env.example` to send real email.
 
 ## Captured screens
 
