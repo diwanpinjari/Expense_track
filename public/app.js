@@ -34,7 +34,7 @@ async function api(path,options={}) {
   if(!response.ok) {if(response.status===401&&state.user){state.user=null;$('#modal').close();renderAuth();}throw new Error(data.error||'Something went wrong.');}
   return data;
 }
-const brand=()=>`<div class="brand"><img src="/favicon.svg" alt="" width="38" height="38"><div>expense<span>PERSONAL FINANCE</span></div></div>`;
+const brand=()=>`<div class="brand"><img src="/favicon.svg" alt="" width="38" height="38"><div>EXPENSES<span>PERSONAL FINANCE</span></div></div>`;
 
 let otpTimer = null;
 function clearOtpTimer() { if (otpTimer) { clearInterval(otpTimer); otpTimer = null; } }
