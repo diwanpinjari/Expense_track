@@ -1,0 +1,15 @@
+node_modules
+data
+screenshots
+test
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+.git
+.vscode

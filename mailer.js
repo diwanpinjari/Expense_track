@@ -46,13 +46,12 @@ function escapeHtml(value) {
 export async function sendOtpEmail({ to, name, code }) {
   const config = settings();
   if (!config) {
-    console.log(`\n  ┌────────────────────────────────────────────┐`);
-    console.log(`  │  ACCOUNT VERIFICATION CODE                  │`);
-    console.log(`  │  ${code}  ·  expires in 10 minutes           │`);
-    console.log(`  │  ${to.padEnd(40).slice(0, 40)}  │`);
-    console.log(`  └────────────────────────────────────────────┘\n`);
-    console.log('  Email delivery is not configured. Enter this code on the website.');
-    console.log('  To send real email, add the SMTP settings shown in .env.example.\n');
+    console.log('\n  ACCOUNT VERIFICATION CODE');
+    console.log(`  Code:   ${code}`);
+    console.log(`  Email:  ${to}`);
+    console.log('  Expires in 10 minutes.');
+    console.log('  Email delivery is not configured; enter this code on the website.');
+    console.log('  To send real email, add the SMTP settings to .env.\n');
     return { delivery: 'console' };
   }
 

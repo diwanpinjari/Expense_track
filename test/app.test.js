@@ -21,7 +21,7 @@ async function register(name,email) {
   assert.equal(r.status,200);return {cookie:r.response.headers.get('set-cookie').split(';')[0],csrf:r.body.csrf,id:r.body.user.id};
 }
 before(async()=>{
-  const app=createApp({
+  const app=await createApp({
     database:':memory:',
     otpSecret:'a-test-only-secret',
     otpCooldownMs:0,
@@ -53,9 +53,9 @@ test('OTP codes are six digits and can only be checked with the server secret',(
 });
 test('private endpoints require sign in',async()=>assert.equal((await request('/api/transactions')).status,401));
 test('fresh installation and newly registered accounts have no financial data',async()=>{
-  const fresh=createApp({database:':memory:'});
+  const fresh=await createApp({database:':memory:'});
   try {
-    for(const name of ['users','transactions','budgets','sessions','registration_otps']) assert.equal(fresh.db.prepare(`SELECT COUNT(*) count FROM ${name}`).get().count,0);
+    for(const name of ['users','transactions','budgets','sessions','registration_otps']) assert.equal((await fresh.db.prepare(`SELECT COUNT(*) count FROM ${name}`).get()).count,0);
   } finally {fresh.db.close();}
   const summary=(await request('/api/summary?month=2026-11',{user:alice})).body;
   assert.equal(summary.income,0);assert.equal(summary.expense,0);assert.equal(summary.balance,0);assert.equal(summary.count,0);
@@ -65,15 +65,15 @@ test('account is not created until the emailed code is verified',async()=>{
   const email='pending@example.com';
   const otp=await requestOtp('Pending Person',email);
   assert.match(otp,/^\d{6}$/);
-  assert.equal(db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
-  const pending=db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
+  assert.equal(await db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
+  const pending=await db.prepare('SELECT * FROM registration_otps WHERE email=?').get(email);
   assert.ok(pending);assert.notEqual(pending.password_hash,'TestPassword123!');assert.notEqual(pending.otp_hash,otp);
   const wrong=await request('/api/register/verify-otp',{method:'POST',data:{email,otp:String((Number(otp)+1)%1000000).padStart(6,'0')}});
   assert.equal(wrong.status,401);assert.match(wrong.body.error,/4 attempts remaining/);
-  assert.equal(db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
+  assert.equal(await db.prepare('SELECT id FROM users WHERE email=?').get(email),undefined);
   const verified=await request('/api/register/verify-otp',{method:'POST',data:{email,otp}});
   assert.equal(verified.status,200);assert.equal(verified.body.user.email,email);
-  assert.equal(db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
+  assert.equal(await db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
   assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp}})).status,400);
 });
 test('resending replaces the old code and expired codes are rejected',async()=>{
@@ -83,7 +83,7 @@ test('resending replaces the old code and expired codes are rejected',async()=>{
   assert.equal(resent.status,200);assert.match(resent.body.delivery,/^(email|console)$/);
   const second=sentCodes.get(email);assert.notEqual(first,second);
   assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp:first}})).status,401);
-  db.prepare('UPDATE registration_otps SET expires_at=? WHERE email=?').run(Date.now()-1,email);
+  await db.prepare('UPDATE registration_otps SET expires_at=? WHERE email=?').run(Date.now()-1,email);
   assert.equal((await request('/api/register/verify-otp',{method:'POST',data:{email,otp:second}})).status,410);
   assert.equal((await request('/api/register/resend-otp',{method:'POST',data:{email}})).status,404);
 });
@@ -96,7 +96,7 @@ test('five incorrect attempts invalidate the code',async()=>{
   }
   const last=await request('/api/register/verify-otp',{method:'POST',data:{email,otp:'000000'}});
   assert.equal(last.status,429);assert.match(last.body.error,/Too many incorrect attempts/);
-  assert.equal(db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
+  assert.equal(await db.prepare('SELECT email FROM registration_otps WHERE email=?').get(email),undefined);
 });
 test('duplicate registration is rejected case insensitively',async()=>{
   const r=await request('/api/register/request-otp',{method:'POST',data:{name:'Another Alice',email:'ALICE@example.com',password:'TestPassword123!'}});assert.equal(r.status,409);
@@ -155,9 +155,9 @@ test('CSV exports only the selected user and filters and escapes notes',async()=
   assert.equal(r.status,200);assert.match(r.body,/'=SUM/);assert.match(r.body,/11\.25/);assert.doesNotMatch(r.body,/Private entry/);
   assert.equal((await request('/api/export?month=2026-08&kind=income',{user:alice})).body.trim().split('\r\n').length,1);
 });
-test('database constraints reject mismatched categories and non-integer money',()=>{
-  assert.throws(()=>db.prepare('INSERT INTO transactions(user_id,category_id,kind,amount_paise,occurred_on) VALUES(?,?,?,?,?)').run(alice.id,9,'expense',100,'2026-10-01'));
-  assert.throws(()=>db.prepare('INSERT INTO transactions(user_id,category_id,kind,amount_paise,occurred_on) VALUES(?,?,?,?,?)').run(alice.id,1,'expense',10.5,'2026-10-01'));
+test('database constraints reject mismatched categories and non-integer money',async()=>{
+  await assert.rejects(()=>db.prepare('INSERT INTO transactions(user_id,category_id,kind,amount_paise,occurred_on) VALUES(?,?,?,?,?)').run(alice.id,9,'expense',100,'2026-10-01'));
+  await assert.rejects(()=>db.prepare('INSERT INTO transactions(user_id,category_id,kind,amount_paise,occurred_on) VALUES(?,?,?,?,?)').run(alice.id,1,'expense',10.5,'2026-10-01'));
 });
 test('logout invalidates the stored session',async()=>{
   const user=await register('Log Out','logout@example.com');
